@@ -1,5 +1,25 @@
 # Beads - AI-Native Issue Tracking
 
+## Getting the issue data in this fork
+
+Only `metadata.json` and `config.yaml` are committed to git. The issues themselves
+live in a Dolt database synced over the `refs/dolt/data` ref on the `misfitdev/emdash`
+fork remote — not on upstream `generalaction/emdash`.
+
+```bash
+bd dolt pull          # fetch issues into a local DB
+bd ready              # unblocked work
+bd memories gitlab    # recorded findings for the GitLab epic (em-yrf)
+```
+
+Push your own changes back with `bd dolt push`. If `bd dolt remote list` shows
+`generalaction/emdash`, it auto-detected `origin` — repoint it at the fork first.
+
+Current work: epic `em-yrf` (GitLab integration, upstream issue #1096). Start with
+`bd show em-yrf`, which carries the cold-start orientation.
+
+---
+
 Welcome to Beads! This repository uses **Beads** for issue tracking - a modern, AI-native tool designed to live directly in your codebase alongside your code.
 
 ## What is Beads?
