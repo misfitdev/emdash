@@ -1,6 +1,7 @@
 import { autorun, observable, runInAction } from 'mobx';
+import { useObserver } from 'mobx-react-lite';
 import type * as monaco from 'monaco-editor';
-import { useEffect, useRef } from 'react';
+import { useEffect, useImperativeHandle, useRef, type Ref } from 'react';
 import type { Facet } from '@core/features/editor/api/browser/open-file-store/facet-handle';
 import {
   openFileStore,
@@ -31,10 +32,12 @@ export interface StickyDiffEditorProps {
   /** Checkout-relative path, used by the save-conflict dialog. */
   filePath: string;
   diffStyle: 'unified' | 'split';
+  /** Jump to the first change when no viewport was saved; disabled for stacked diffs. */
+  revealFirstChange?: boolean;
   /** Called whenever the content height changes, for auto-sizing parent containers. */
   onHeightChange?: (height: number) => void;
-  /** Called when the diff editor instance is created/disposed. */
-  onEditorChange?: (editor: monaco.editor.IStandaloneDiffEditor | null) => void;
+  /** Native editor handle; callback refs can return cleanup for editor integrations. */
+  ref?: Ref<monaco.editor.IStandaloneDiffEditor | null>;
 }
 
 const EMPTY_SIDE_URI = 'emdash-diff-empty';
@@ -95,8 +98,9 @@ export function StickyDiffEditor({
   modified,
   filePath,
   diffStyle,
+  revealFirstChange = true,
   onHeightChange,
-  onEditorChange,
+  ref,
 }: StickyDiffEditorProps) {
   const mountRef = useRef<HTMLDivElement>(null);
 
@@ -125,8 +129,8 @@ export function StickyDiffEditor({
   const onHeightChangeRef = useRef(onHeightChange);
   onHeightChangeRef.current = onHeightChange;
 
-  const onEditorChangeRef = useRef(onEditorChange);
-  onEditorChangeRef.current = onEditorChange;
+  const editor = useObserver(() => editorBox.get());
+  useImperativeHandle<typeof editor, typeof editor>(ref, () => editor, [editor]);
 
   const { effectiveTheme } = useTheme();
 
@@ -141,7 +145,6 @@ export function StickyDiffEditor({
       readOnly: true,
       renderSideBySide: diffStyle === 'split',
     });
-    onEditorChangeRef.current?.(editor);
 
     const modifiedEditor = editor.getModifiedEditor();
     modifiedEditor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.KeyS, () => {
@@ -162,7 +165,6 @@ export function StickyDiffEditor({
 
     const emptyModels = emptyModelsRef.current;
     return () => {
-      onEditorChangeRef.current?.(null);
       heightDisposable.dispose();
       // Save the viewport before disposal. The sides effect's cleanup can't
       // cover unmount: it runs after this one, when editorBox is already null.
@@ -218,6 +220,7 @@ export function StickyDiffEditor({
       return model;
     };
 
+    let initialReveal: monaco.IDisposable | undefined;
     const disposer = autorun(() => {
       const editor = editorBox.get(); // reactive: waits for editor to exist
       if (!editor) return;
@@ -239,17 +242,38 @@ export function StickyDiffEditor({
 
       const attached = editor.getModel();
       if (attached?.original === origModel && attached?.modified === modModel) return;
+      initialReveal?.dispose();
       if (attached) editor.setModel(null);
 
       editor.setModel({ original: origModel, modified: modModel });
       attachedUrisRef.current = { original: sideUri(original), modified: sideUri(modified) };
       editor.layout();
       // Restore scroll/cursor for the incoming side pair.
-      installMonacoFacetBinder().restoreDiffViewState(sideUri(original), sideUri(modified), editor);
+      const restored = installMonacoFacetBinder().restoreDiffViewState(
+        sideUri(original),
+        sideUri(modified),
+        editor
+      );
+      if (!restored && revealFirstChange) {
+        initialReveal = editor.onDidUpdateDiff(() => {
+          initialReveal?.dispose();
+          initialReveal = undefined;
+          const change = editor.getLineChanges()?.[0];
+          const m = monacoBootstrap.getMonaco();
+          if (!change || !m) return;
+          editor
+            .getModifiedEditor()
+            .revealLineNearTop(
+              Math.max(1, change.modifiedStartLineNumber),
+              m.editor.ScrollType.Immediate
+            );
+        });
+      }
       onHeightChangeRef.current?.(editor.getModifiedEditor().getContentHeight());
     });
 
     return () => {
+      initialReveal?.dispose();
       // On unmount or side change: save the current viewport so it can be restored later.
       const ed = editorBox.get();
       if (ed?.getModel()) {
@@ -259,7 +283,7 @@ export function StickyDiffEditor({
     };
     // editorBox is a stable ref created once; only side-identity changes recreate the autorun.
     // oxlint-disable-next-line react/exhaustive-deps
-  }, [originalKey, modifiedKey]);
+  }, [originalKey, modifiedKey, revealFirstChange]);
 
   return <div ref={mountRef} className="h-full" />;
 }

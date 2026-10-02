@@ -1,4 +1,5 @@
-import type { AttachmentRef } from '@emdash/core/runtimes/acp/api/client';
+import { formatHostRef } from '@emdash/core/primitives/host/api';
+import type { AttachmentRef } from '@emdash/core/services/attachments/api';
 import { ChatComposer, ImageViewerDialog, MermaidViewerDialog } from '@emdash/ui/react/components';
 import type {
   CommandItem,
@@ -10,7 +11,7 @@ import type {
   PromptEditorRef,
 } from '@emdash/ui/react/components';
 import { Button, toast } from '@emdash/ui/react/primitives';
-import { ArrowDown } from 'lucide-react';
+import { ArrowDown, MessageSquare } from 'lucide-react';
 import { observer, useObserver } from 'mobx-react-lite';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -23,7 +24,16 @@ import type {
   ChatCommands,
   ChatView,
 } from '@core/features/conversations/api/browser/chat/chat-transcript';
+import {
+  diffCommentsMention,
+  hasDiffCommentsMention,
+} from '@core/features/conversations/api/browser/chat/diff-comments-mention';
+import { useProviderSettings } from '@core/features/conversations/api/browser/provider-preferences';
 import { conversationRegistry } from '@core/features/conversations/api/browser/stores/conversation-registry';
+import {
+  providerComposerOptions,
+  selectCachedProviderOptions,
+} from '@core/features/conversations/contributions/browser/provider-composer-options';
 import { useConnectedIssueProviders } from '@core/features/integrations/api/browser/use-connected-issue-providers';
 import { IntegrationIcon } from '@core/features/integrations/contributions/browser/integration-icon';
 import { getIssuesClient } from '@core/features/issues/api/browser/client';
@@ -36,6 +46,7 @@ import {
 } from '@core/features/projects/api/browser/stores/project-selectors';
 import { getSearchClient } from '@core/features/search/api/client';
 import { getGitRepositoryStore } from '@core/features/source-control/api/browser/stores/source-control-selectors';
+import { draftCommentsStoreToken } from '@core/features/source-control/contributions/browser/task-stores';
 // TODO(conversations-extraction): Pass task state into ACP chat instead of importing task stores.
 import {
   asProvisioned,
@@ -46,6 +57,7 @@ import { openModal } from '@core/manifests/browser/modal-api';
 import { projectAvailabilityUi } from '@core/manifests/browser/project-availability-ui';
 import { openExternal } from '@core/primitives/desktop-host/browser/host-client';
 import { issueMentionToken, parseIssueMentionToken } from '@core/primitives/issues/api';
+import { resolveIssueMentionSource } from '@core/primitives/issues/api/issue-context';
 import { linkedIssueMentionName, type LinkedIssue } from '@core/primitives/linked-issues/api';
 import { log } from '@core/primitives/logging/browser/logger';
 import { usePaneContext } from '@core/primitives/workbench-shell/browser/tabs/pane-context';
@@ -57,6 +69,7 @@ import {
   toAcpImageAttachmentMimeType,
   uploadDroppedFile,
 } from './acp-dropped-file';
+import { appendDraftCommentsContext } from './draft-comments-context';
 import { buildIssueMentionHiddenContext } from './issue-mention-context';
 import { createTranscriptFileCommands } from './transcript-file-commands';
 
@@ -81,7 +94,7 @@ function commandMatchesQuery(command: CommandItem, query: string): boolean {
 }
 
 function toIssueMentionItem(issue: LinkedIssue): MentionItem {
-  const token = issueMentionToken(issue.provider, issue.identifier);
+  const token = issueMentionToken(issue.provider, issue.identifier, issue);
   return {
     id: token,
     label: token,
@@ -191,8 +204,8 @@ function bytesToBase64(bytes: Uint8Array): string {
 
 // ── Composer for a single store ────────────────────────────────────────────────
 //
-// Keyed by conversationId in the parent so that drafts, focus, and editor state
-// reset when switching conversations — the same isolation the old remount gave.
+// Keyed by conversationId to isolate view-local UI. The store owns the editor
+// model so the document, selection, viewport and undo history survive remounts.
 
 const ComposerForStore = observer(function ComposerForStore({
   store,
@@ -208,20 +221,31 @@ const ComposerForStore = observer(function ComposerForStore({
   const attachments = store.draftAttachments.map(toComposerAttachment);
   const { value: promptLibrary } = usePromptLibrary();
   const disabledReason = projectAvailabilityUi.getLiveActionDisabledReason(store.projectId);
+  const draftComments = getTaskStore(store.projectId, store.taskId)?.get(draftCommentsStoreToken);
 
   // Autofocus when the slot becomes available.
   useEffect(() => {
     editorApiRef.current?.focus();
-  }, []);
+  }, [composerSlot]);
 
   const buildHiddenIssueContext = useCallback(
     (value: string) =>
       buildIssueMentionHiddenContext(value, async (target) => {
+        const source = resolveIssueMentionSource(
+          target,
+          getRegisteredTaskData(store.projectId, store.taskId)?.linkedIssue
+        );
+        if (!source) return null;
         const result = await (
           await getIssuesClient()
         ).getIssueContext({
           provider: target.provider,
-          options: { identifier: target.identifier, projectId: store.projectId },
+          options: {
+            identifier: source.identifier,
+            accountId: source.accountId,
+            issueUrl: source.issueUrl,
+            projectId: store.projectId,
+          },
         });
         if (!result.success) {
           log.warn('Failed to resolve issue mention context', {
@@ -232,18 +256,21 @@ const ComposerForStore = observer(function ComposerForStore({
         }
         return result.data;
       }),
-    [store.projectId]
+    [store.projectId, store.taskId]
   );
 
   const handleSubmit = useCallback(
     (value: string) => {
       const promptAttachments = store.draftAttachments;
       if (!value.trim() && promptAttachments.length === 0) return;
-      const hiddenContext = buildHiddenIssueContext(value);
-      store.submitPrompt(value, promptAttachments, hiddenContext);
-      editorApiRef.current?.clear();
+      const comments = hasDiffCommentsMention(value) ? (draftComments?.comments ?? []) : [];
+      const hiddenContext = appendDraftCommentsContext(buildHiddenIssueContext(value), comments);
+      // Only consume the comments that were sent; ones added or edited mid-flight stay drafted.
+      store.submitPrompt(value, promptAttachments, hiddenContext, () =>
+        draftComments?.deleteSent(comments)
+      );
     },
-    [store, buildHiddenIssueContext]
+    [store, buildHiddenIssueContext, draftComments]
   );
 
   const handleStop = useCallback(() => {
@@ -274,34 +301,6 @@ const ComposerForStore = observer(function ComposerForStore({
           store.sendQueuedPromptNow(id);
         }
       });
-    },
-    [store]
-  );
-
-  const handleModelChange = useCallback(
-    (modelId: string) => {
-      store.setModel(modelId);
-    },
-    [store]
-  );
-
-  const handleModeChange = useCallback(
-    (modeId: string) => {
-      store.setMode(modeId);
-    },
-    [store]
-  );
-
-  const handleCollaborationModeChange = useCallback(
-    (modeId: string) => {
-      store.setCollaborationMode(modeId);
-    },
-    [store]
-  );
-
-  const handleEffortChange = useCallback(
-    (effortId: string) => {
-      store.setEffort(effortId);
     },
     [store]
   );
@@ -410,6 +409,7 @@ const ComposerForStore = observer(function ComposerForStore({
   const issueProviderContext = useObserver(() => {
     const project = projectData(getProjectStore(store.projectId));
     return {
+      projectId: store.projectId,
       projectPath: project?.path,
       repositoryUrl:
         getGitRepositoryStore(store.projectId)?.issueRepositoryUrl ??
@@ -426,7 +426,7 @@ const ComposerForStore = observer(function ComposerForStore({
   }, [connectedProviders, isProviderUsable, issueProviderContext.selectedIssueProvider]);
 
   const mentionProvider = useMemo<ContextMentionProvider | undefined>(() => {
-    if (!workspaceId && !linkedIssue && !issueProvider) return undefined;
+    if (!workspaceId && !linkedIssue && !issueProvider && !draftComments) return undefined;
     const wsId = workspaceId;
     return {
       async search(query: string): Promise<MentionItem[]> {
@@ -493,13 +493,30 @@ const ComposerForStore = observer(function ComposerForStore({
           description: file.relativePath,
         }));
 
-        return [...pinnedIssueItems, ...fileItems, ...searchedIssueItems];
+        const draftCommentCount = draftComments?.count ?? 0;
+        const commentItems: MentionItem[] =
+          draftCommentCount > 0 &&
+          diffCommentsMention.name.toLowerCase().includes(query.trim().toLowerCase())
+            ? [
+                {
+                  ...diffCommentsMention,
+                  description:
+                    draftCommentCount === 1
+                      ? '1 pending comment'
+                      : `${draftCommentCount} pending comments`,
+                  icon: <MessageSquare size={13} />,
+                },
+              ]
+            : [];
+
+        return [...commentItems, ...pinnedIssueItems, ...fileItems, ...searchedIssueItems];
       },
     };
   }, [
     workspaceId,
     linkedIssue,
     issueProvider,
+    draftComments,
     store.projectId,
     issueProviderContext.projectPath,
     issueProviderContext.repositoryUrl,
@@ -520,7 +537,19 @@ const ComposerForStore = observer(function ComposerForStore({
   const providerId =
     conversationRegistry.get(store.taskId)?.conversations.get(store.conversationId)?.data
       .providerId ?? null;
+  const providerOptions = store.providerOptions;
+  const { settings } = useProviderSettings(
+    providerOptions === undefined && providerId
+      ? {
+          host: formatHostRef(hostRefFromConnectionId(getProjectSshConnectionId(store.projectId))),
+          providerId,
+        }
+      : null
+  );
+  const composerOptions =
+    providerOptions ?? selectCachedProviderOptions(settings.catalogs, store.configuredOptions);
   const renderMentionIcon = useCallback(({ id, kind }: { id: string; kind: string }) => {
+    if (id === diffCommentsMention.id) return <MessageSquare size={12} />;
     if (kind !== 'issue') return null;
     const target = parseIssueMentionToken(id);
     if (!target) return null;
@@ -566,18 +595,32 @@ const ComposerForStore = observer(function ComposerForStore({
       {!disabledReason && store.loadError && (
         <div className="border-destructive/30 bg-destructive/5 mx-3 mb-1 flex items-center justify-between gap-2 rounded-md border px-2 py-1 text-xs">
           <span className="truncate text-foreground-muted">{store.loadError.message}</span>
-          <Button variant="secondary" size="sm" onClick={() => store.retry()}>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={store.historyLoading}
+            onClick={() => store.retry()}
+          >
             Retry
           </Button>
+          {store.loadError.kind === 'session_not_found' && (
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={store.historyLoading}
+              onClick={() => store.retry({ mode: 'fresh' })}
+            >
+              Start fresh session
+            </Button>
+          )}
         </div>
       )}
       <div>
         <ChatComposer
+          model={store.composerModel}
           isWorking={a.isWorking}
           canSubmit={a.canSubmit}
-          value={store.draftText}
           onSubmit={handleSubmit}
-          onInputChange={(text) => store.setDraftText(text)}
           onSubmitWhileWorking={store.liveActionsEnabled ? handleSubmit : undefined}
           onStop={a.canCancel ? handleStop : undefined}
           permissionRequest={permissionRequest}
@@ -589,20 +632,13 @@ const ComposerForStore = observer(function ComposerForStore({
           onReorderQueuedPrompts={(ids) => store.reorderQueuedPrompts(ids)}
           onSendQueuedPromptNow={handleSendQueuedPromptNow}
           editorApiRef={editorApiRef}
-          modelOptions={store.modelOptions}
-          selectedModel={store.model ?? undefined}
-          onModelChange={store.liveActionsEnabled ? handleModelChange : undefined}
-          effortOptions={store.effortOptions}
-          selectedEffort={store.effort ?? undefined}
-          onEffortChange={store.liveActionsEnabled ? handleEffortChange : undefined}
-          permissionModeOptions={store.permissionModeOptions}
-          selectedPermissionMode={store.permissionMode ?? undefined}
-          onPermissionModeChange={store.liveActionsEnabled ? handleModeChange : undefined}
-          collaborationModeOptions={store.collaborationModeOptions}
-          selectedCollaborationMode={store.collaborationMode ?? undefined}
-          onCollaborationModeChange={
-            store.liveActionsEnabled ? handleCollaborationModeChange : undefined
-          }
+          {...providerComposerOptions(
+            composerOptions,
+            store.configuredOptions,
+            (id, value) => store.setOption(id, value),
+            store.canSetOptions,
+            providerOptions !== undefined
+          )}
           mcpServers={store.mcpServers}
           agentOptions={agentOptions}
           selectedAgent={providerId ?? undefined}
@@ -644,8 +680,8 @@ const ComposerForStore = observer(function ComposerForStore({
 // triggers ChatTranscript's setModel effect — the Solid view swaps ChatState
 // in-place without dispose/recreate, preserving per-conversation scroll.
 //
-// The composer subtree is keyed by conversationId so draft text, focus, and
-// editor state reset on each switch (equivalent to the old remount behavior).
+// The composer subtree is keyed by conversationId; each store retains its own
+// editor model while only the active conversation has a mounted editor view.
 
 export const AcpChatPanel = observer(function AcpChatPanel() {
   const { pane } = usePaneContext();
@@ -795,11 +831,21 @@ export const AcpChatPanel = observer(function AcpChatPanel() {
         if (arg.kind === 'issue') {
           const target = parseIssueMentionToken(arg.id);
           if (!target) return;
+          const source = resolveIssueMentionSource(
+            target,
+            getRegisteredTaskData(store.projectId, store.taskId)?.linkedIssue
+          );
+          if (!source) return;
           void getIssuesClient()
             .then((client) =>
               client.getIssueContext({
                 provider: target.provider,
-                options: { identifier: target.identifier, projectId: store.projectId },
+                options: {
+                  identifier: source.identifier,
+                  accountId: source.accountId,
+                  issueUrl: source.issueUrl,
+                  projectId: store.projectId,
+                },
               })
             )
             .then((result) => {
@@ -816,7 +862,8 @@ export const AcpChatPanel = observer(function AcpChatPanel() {
 
   const unavailableWithoutTranscript =
     store.loadError?.kind === 'unavailable' && store.messageCount === 0;
-  const showComposer = store.historyKnown || store.messageCount > 0;
+  const showComposer =
+    store.loadError?.kind !== 'auth_required' && (store.historyKnown || store.messageCount > 0);
   const showBlockingOverlay =
     !showComposer &&
     (store.historyLoading ||
@@ -840,8 +887,8 @@ export const AcpChatPanel = observer(function AcpChatPanel() {
         style={{ position: 'absolute', inset: 0 }}
       />
 
-      {/* Unknown restored history owns the content area until it can be laid out. Fresh chats
-          render their centered composer immediately, independently of provider activation. */}
+      {/* Authentication errors own the content area so sign-in remains accessible even after
+          attachment. Otherwise, show the composer as soon as history is known. */}
       {overlaySlot &&
         showBlockingOverlay &&
         createPortal(
@@ -890,6 +937,15 @@ export const AcpChatPanel = observer(function AcpChatPanel() {
                   >
                     Retry
                   </Button>
+                  {store.loadError.kind === 'session_not_found' && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => store.retry({ mode: 'fresh' })}
+                    >
+                      Start fresh session
+                    </Button>
+                  )}
                 </div>
               )
             ) : (
