@@ -108,3 +108,9 @@ packages/plugins/src/agents/impl/*/fixtures/acp-transcript.json
 # Nx local cache and workspace data
 .nx/cache
 .nx/workspace-data
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
