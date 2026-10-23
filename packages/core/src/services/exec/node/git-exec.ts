@@ -1,4 +1,5 @@
 import { createBoundExec, type BoundExec } from '#services/exec/api';
+import { shouldUseDefaultBatchModeSsh } from './git-ssh-command';
 
 export type GitExecFactory = (cwd: string) => BoundExec;
 
@@ -9,11 +10,12 @@ export type GitExecFactory = (cwd: string) => BoundExec;
  * fast instead of blocking on credential or host-key input.
  */
 export function createNonInteractiveGitExec(cwd: string): BoundExec {
-  return createBoundExec({
+  const base = process.env;
+  const bound = createBoundExec({
     file: 'git',
     cwd,
-    env: {
-      ...process.env,
+    env: async () => ({
+      ...base,
       LC_ALL: 'C',
       LANG: 'C',
       LANGUAGE: 'C',
@@ -21,7 +23,16 @@ export function createNonInteractiveGitExec(cwd: string): BoundExec {
       GCM_INTERACTIVE: 'never',
       GIT_ASKPASS: '',
       SSH_ASKPASS: '',
-      ...(process.env.GIT_SSH_COMMAND ? {} : { GIT_SSH_COMMAND: 'ssh -o BatchMode=yes' }),
+      // Git's core.sshCommand may select a key for the repository's host or org.
+      SSH_ASKPASS_REQUIRE: 'never',
+      ...((await shouldUseDefaultBatchModeSsh('git', cwd, base)) && !base.GIT_SSH_COMMAND
+        ? { GIT_SSH_COMMAND: 'ssh -o BatchMode=yes' }
+        : {}),
+    }),
+  });
+  return Object.assign(bound, {
+    withCwd(nextCwd: string) {
+      return createNonInteractiveGitExec(nextCwd);
     },
   });
 }

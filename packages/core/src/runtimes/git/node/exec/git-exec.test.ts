@@ -12,11 +12,13 @@ describe('gitEnv', () => {
     });
   });
 
-  it('defaults SSH to batch mode without overriding caller configuration', () => {
-    expect(gitEnv({ GIT_SSH_COMMAND: undefined }).GIT_SSH_COMMAND).toBe('ssh -o BatchMode=yes');
+  it('preserves Git SSH routing while disabling SSH askpass', () => {
+    expect(gitEnv({ GIT_SSH_COMMAND: undefined }).GIT_SSH_COMMAND).toBeUndefined();
+    expect(gitEnv({}, true).GIT_SSH_COMMAND).toBe('ssh -o BatchMode=yes');
     expect(gitEnv({ GIT_SSH_COMMAND: 'ssh -F custom-config' }).GIT_SSH_COMMAND).toBe(
       'ssh -F custom-config'
     );
+    expect(gitEnv({}).SSH_ASKPASS_REQUIRE).toBe('never');
   });
 
   it('loads the current environment for every git subprocess', async () => {

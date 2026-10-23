@@ -7,6 +7,7 @@ import {
   type ExecResult,
   type ExecSpawnOptions,
 } from '#services/exec/api';
+import { shouldUseDefaultBatchModeSsh } from '#services/exec/node/git-ssh-command';
 import { gitRuntimeEnv } from '../non-interactive-env';
 
 export type CreateGitExecOptions = {
@@ -20,7 +21,7 @@ export type CreateGitExecOptions = {
  * SSH_AUTH_SOCK, credential helpers), so it is composed in deliberately — exec itself
  * never merges `process.env`.
  */
-export function gitEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function gitEnv(base: NodeJS.ProcessEnv, useDefaultSsh = false): NodeJS.ProcessEnv {
   const env = gitRuntimeEnv(base);
   return {
     ...env,
@@ -31,17 +32,29 @@ export function gitEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     GCM_INTERACTIVE: 'never',
     GIT_ASKPASS: '',
     SSH_ASKPASS: '',
-    ...(env.GIT_SSH_COMMAND ? {} : { GIT_SSH_COMMAND: 'ssh -o BatchMode=yes' }),
+    // Leave Git's core.sshCommand (or an explicit GIT_SSH_COMMAND) in control of key routing.
+    SSH_ASKPASS_REQUIRE: 'never',
+    ...(useDefaultSsh && !env.GIT_SSH_COMMAND ? { GIT_SSH_COMMAND: 'ssh -o BatchMode=yes' } : {}),
   };
 }
 
 export function createGitExec(options: CreateGitExecOptions): BoundExec {
   const source = options.env;
-  const env = typeof source === 'function' ? async () => gitEnv(await source()) : gitEnv(source);
-  return createBoundExec({
-    file: options.executable ?? 'git',
+  const executable = options.executable ?? 'git';
+  const env = async () => {
+    const base = typeof source === 'function' ? await source() : source;
+    const useDefaultSsh = await shouldUseDefaultBatchModeSsh(executable, options.cwd, base);
+    return gitEnv(base, useDefaultSsh);
+  };
+  const bound = createBoundExec({
+    file: executable,
     cwd: options.cwd,
     env,
+  });
+  return Object.assign(bound, {
+    withCwd(cwd: string) {
+      return createGitExec({ ...options, cwd });
+    },
   });
 }
 
